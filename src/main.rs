@@ -563,7 +563,6 @@ fn validate_body(
     }
 
     let path = ["http_assets".into(), uri.path().into()];
-    println!("START {}", uri.path());
     let tree_sha = match tree.lookup_path(&path) {
         LookupResult::Found(v) => {
             v
@@ -583,7 +582,7 @@ fn validate_body(
 
     let mut sha256 = Sha256::new();
     sha256.update(response_body);
-    let body_sha = sha256.finalize();
+    let body_sha: [u8; 32] = sha256.finalize().into();
 
     if let Some(tree) = chunk_tree {
         let chunk_tree: HashTree = serde_cbor::from_slice(&tree).map_err(AgentError::InvalidCborData)?;
@@ -611,9 +610,9 @@ fn validate_body(
             }
         };
         
-        Ok(&body_sha[..] == chunk_sha)
+        Ok(body_sha == chunk_sha)
     } else {    
-        Ok(&body_sha[..] == tree_sha)
+        Ok(body_sha == tree_sha)
     }
 }
 
