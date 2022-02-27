@@ -35,6 +35,8 @@ use std::{
         Arc, Mutex,
     },
 };
+use std::io::prelude::{Read};
+use flate2::read::{GzDecoder, DeflateDecoder};
 
 mod config;
 mod logging;
@@ -284,6 +286,7 @@ async fn forward_request(
     let mut tree: Option<Result<Vec<u8>, ()>> = None;
     let mut chunk_tree: Option<Vec<u8>> = None;
     let mut chunk_index: u64 = 0;
+    let mut encoding: Option<String> = None;
 
     let mut builder = Response::builder().status(StatusCode::from_u16(http_response.status_code)?);
     for HeaderField(name, value) in http_response.headers {
@@ -356,6 +359,9 @@ async fn forward_request(
                     }
                 }
             }
+        } else if name.eq_ignore_ascii_case("CONTENT-ENCODING") {
+            let enc = value.trim().to_string();
+            encoding = Some(enc);
         }
 
         builder = builder.header(&name, value);
@@ -366,6 +372,7 @@ async fn forward_request(
     } else {
         None
     };
+    let decoded_body = decode_body(&http_response.body, encoding);
     let is_streaming = http_response.streaming_strategy.is_some();
     let response = if let Some(streaming_strategy) = http_response.streaming_strategy {
         let (mut sender, body) = body::Body::channel();
@@ -427,7 +434,7 @@ async fn forward_request(
                 &canister_id,
                 &agent,
                 &uri,
-                &http_response.body,
+                &decoded_body,
                 logger.clone(),
             ) {
                 Ok(valid) => valid,
@@ -487,6 +494,25 @@ async fn forward_request(
     Ok(response)
 }
 
+fn decode_body(body: &[u8], encoding: Option<String>) -> Vec<u8> {
+    match encoding {
+        Some(enc) => match enc.as_str() {
+            "gzip" => {
+                let decoded: &mut Vec<u8> = &mut vec![]; 
+                GzDecoder::new(body).read_to_end(decoded).unwrap();
+                decoded.to_vec()
+            },
+            "deflate" => {
+                let decoded: &mut Vec<u8> = &mut vec![]; 
+                DeflateDecoder::new(body).read_to_end(decoded).unwrap();
+                decoded.to_vec()
+            },
+            _ => body.to_vec(),
+        },
+        _ => body.to_vec(),
+    }
+}
+
 fn validate_body(
     certificate: &[u8],
     tree: &[u8],
@@ -537,8 +563,11 @@ fn validate_body(
     }
 
     let path = ["http_assets".into(), uri.path().into()];
+    println!("START {}", uri.path());
     let tree_sha = match tree.lookup_path(&path) {
-        LookupResult::Found(v) => v,
+        LookupResult::Found(v) => {
+            v
+        },
         _ => match tree.lookup_path(&["http_assets".into(), "/index.html".into()]) {
             LookupResult::Found(v) => v,
             _ => {
