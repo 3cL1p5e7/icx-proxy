@@ -282,6 +282,8 @@ async fn forward_request(
 
     let mut certificate: Option<Result<Vec<u8>, ()>> = None;
     let mut tree: Option<Result<Vec<u8>, ()>> = None;
+    let mut chunk_tree: Option<Vec<u8>> = None;
+    let mut chunk_index: u64 = 0;
 
     let mut builder = Response::builder().status(StatusCode::from_u16(http_response.status_code)?);
     for HeaderField(name, value) in http_response.headers {
@@ -289,6 +291,10 @@ async fn forward_request(
             for field in value.split(',') {
                 if let Some((_, name, b64_value)) = regex_captures!("^(.*)=:(.*):$", field.trim()) {
                     slog::trace!(logger, ">> certificate {}: {}", name, b64_value);
+                    if name == "chunk_index" {
+                        chunk_index = b64_value.parse::<u64>().ok().unwrap_or(0);
+                        continue;
+                    }
                     let bytes = base64::decode(b64_value).map_err(|e| {
                         slog::warn!(
                             logger,
@@ -335,6 +341,18 @@ async fn forward_request(
                                 bytes
                             }
                         });
+                    } else if name == "chunk_tree" {
+                        chunk_tree = match (chunk_tree, bytes) {
+                            (None, bytes) => bytes.ok(),
+                            (Some(chunk_tree), Ok(bytes)) => {
+                                slog::warn!(logger, "duplicate chunk_tree field: {:?}", bytes);
+                                Some(chunk_tree)
+                            },
+                            (Some(chunk_tree), Err(_)) => {
+                                slog::warn!(logger, "duplicate chunk_tree field (failed to decode)");
+                                Some(chunk_tree)
+                            },
+                        };
                     }
                 }
             }
@@ -404,6 +422,8 @@ async fn forward_request(
             (Some(Ok(certificate)), Some(Ok(tree))) => match validate_body(
                 &certificate,
                 &tree,
+                chunk_tree,
+                chunk_index,
                 &canister_id,
                 &agent,
                 &uri,
@@ -470,6 +490,8 @@ async fn forward_request(
 fn validate_body(
     certificate: &[u8],
     tree: &[u8],
+    chunk_tree: Option<Vec<u8>>,
+    chunk_index: u64,
     canister_id: &Principal,
     agent: &Agent,
     uri: &Uri,
@@ -534,7 +556,36 @@ fn validate_body(
     sha256.update(response_body);
     let body_sha = sha256.finalize();
 
-    Ok(&body_sha[..] == tree_sha)
+    if let Some(tree) = chunk_tree {
+        let chunk_tree: HashTree = serde_cbor::from_slice(&tree).map_err(AgentError::InvalidCborData)?;
+
+        let chunk_tree_digest = chunk_tree.digest();
+
+        if chunk_tree_digest != tree_sha {
+            slog::trace!(
+                logger,
+                ">> Invalid chunk_tree in the header. Digest does not equal tree_sha",
+            );
+            return Ok(false);
+        }
+
+        let index_path = [chunk_index.to_string().into()];
+        let chunk_sha = match chunk_tree.lookup_path(&index_path) {
+            LookupResult::Found(v) => v,
+            _ => {
+                slog::trace!(
+                    logger,
+                    ">> Invalid Tree in the header. Does not contain path {:?}",
+                    path
+                );
+                return Ok(false);
+            }
+        };
+        
+        Ok(&body_sha[..] == chunk_sha)
+    } else {    
+        Ok(&body_sha[..] == tree_sha)
+    }
 }
 
 fn is_hop_header(name: &str) -> bool {
